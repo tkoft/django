@@ -83,7 +83,8 @@ def DO_NOTHING(collector, field, sub_objs, using):
 
 def get_candidate_relations_to_delete(opts):
     # The candidate relations are the ones that come from N-1 and 1-1 relations.
-    # N-N  (i.e., many-to-many) relations aren't candidates for deletion.
+    # N-N  (i.e., many-to-many) relations aren't directly candidates for
+    # deletion, but the generated intermediate model N-1 relations are.
     return (
         f
         for f in opts.get_fields(include_hidden=True)
@@ -105,6 +106,9 @@ class Collector:
         # fast_deletes is a list of queryset-likes that can be deleted without
         # fetching the objects into memory.
         self.fast_deletes = []
+        # {(obj, m2m_attname): {pks, ...}}
+        self.removed_m2m_pk_sets = {}
+        self.keep_parents = False
 
         # Tracks deletion-order dependency for databases without transactions
         # or ability to defer constraint checks. Only concrete model classes
@@ -178,9 +182,56 @@ class Collector:
             self.clear_restricted_objects_from_set(model, objs)
 
     def _has_signal_listeners(self, model):
-        return signals.pre_delete.has_listeners(
-            model
-        ) or signals.post_delete.has_listeners(model)
+        return (
+            signals.pre_delete.has_listeners(model)
+            or signals.post_delete.has_listeners(model)
+            or signals.m2m_changed.has_listeners(model)
+        )
+
+    def _send_m2m_changed(self, model, obj, action):
+        """
+        Send `m2m_changed` signal for all many-to-many relations for `model` if
+        any instances of that relation exist on `obj`.
+        """
+        from django.db.models import ManyToManyField, ManyToManyRel
+
+        m2m_relations = [
+            f for f in model._meta.get_fields(include_parents=False) if f.many_to_many
+        ]
+        for m2m_relation in m2m_relations:
+            if m2m_relation.model in model._meta.all_parents:
+                continue
+            if isinstance(m2m_relation, ManyToManyField):
+                # Forward direction
+                attr_name = m2m_relation.name
+                through = m2m_relation.remote_field.through
+                reverse = False
+            elif isinstance(m2m_relation, ManyToManyRel):
+                # Reverse direction
+                attr_name = m2m_relation.get_accessor_name()
+                through = m2m_relation.through
+                reverse = True
+            # Don't send if no one is listening to avoid a db hit
+            if not signals.m2m_changed.has_listeners(through):
+                continue
+            # Fetch pks to remove, from db or cache
+            key = (obj, attr_name)
+            if key in self.removed_m2m_pk_sets:
+                pk_set = self.removed_m2m_pk_sets[key]
+            else:
+                manager = getattr(obj, attr_name)
+                pk_set = set(manager.values_list("pk", flat=True))
+                self.removed_m2m_pk_sets[key] = pk_set
+            if pk_set:
+                signals.m2m_changed.send(
+                    action=action,
+                    sender=through,
+                    instance=obj,
+                    reverse=reverse,
+                    model=m2m_relation.related_model,
+                    pk_set=self.removed_m2m_pk_sets[key],
+                    using=self.using,
+                )
 
     def can_fast_delete(self, objs, from_field=None):
         """
@@ -462,12 +513,18 @@ class Collector:
                         using=self.using,
                         origin=self.origin,
                     )
+                    self._send_m2m_changed(model, obj, "pre_remove")
 
-            # fast deletes
+            # fast deletes, including m2m objects
             for qs in self.fast_deletes:
                 count = qs._raw_delete(using=self.using)
                 if count:
                     deleted_counter[qs.model._meta.label] += count
+
+            # send m2m_changed post_remove signal
+            for model, instances in self.data.items():
+                for obj in instances:
+                    self._send_m2m_changed(model, obj, "post_remove")
 
             # update fields
             for (field, value), instances_list in self.field_updates.items():

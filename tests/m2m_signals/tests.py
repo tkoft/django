@@ -28,6 +28,7 @@ class ManyToManySignalsTest(TestCase):
 
     def setUp(self):
         self.m2m_changed_messages = []
+        self.m2m_changed_messages_as_pks = []
 
     def m2m_changed_signal_receiver(self, signal, sender, **kwargs):
         message = {
@@ -41,6 +42,14 @@ class ManyToManySignalsTest(TestCase):
                 kwargs["model"].objects.filter(pk__in=kwargs["pk_set"])
             )
         self.m2m_changed_messages.append(message)
+        as_pks = {
+            "instance": message["instance"].pk,
+            "action": kwargs["action"],
+            "reverse": kwargs["reverse"],
+            "model": kwargs["model"],
+            "pk_set": kwargs["pk_set"],
+        }
+        self.m2m_changed_messages_as_pks.append(as_pks)
 
     def tearDown(self):
         # disconnect all signal handlers
@@ -576,3 +585,138 @@ class ManyToManySignalsTest(TestCase):
                 },
             ],
         )
+
+    def test_m2m_relation_signals_object_deletion_forward(self):
+        self.vw.default_parts.add(self.wheelset)
+        self.vw.default_parts.add(self.sunroof)
+        self._initialize_signal_car()
+        vw_pk = self.vw.pk
+        self.vw.delete()
+        self.assertEqual(
+            self.m2m_changed_messages_as_pks,
+            [
+                {
+                    "instance": vw_pk,
+                    "action": "pre_remove",
+                    "reverse": False,
+                    "model": Part,
+                    "pk_set": {self.sunroof.pk, self.wheelset.pk},
+                },
+                {
+                    "instance": vw_pk,
+                    "action": "post_remove",
+                    "reverse": False,
+                    "model": Part,
+                    "pk_set": {self.sunroof.pk, self.wheelset.pk},
+                },
+            ],
+        )
+
+    def test_m2m_relation_signals_object_deletion_reverse(self):
+        self.vw.default_parts.add(self.sunroof)
+        self.bmw.default_parts.add(self.sunroof)
+        self._initialize_signal_car()
+        sunroof_pk = self.sunroof.pk
+        self.sunroof.delete()
+        self.assertEqual(
+            self.m2m_changed_messages_as_pks,
+            [
+                {
+                    "instance": sunroof_pk,
+                    "action": "pre_remove",
+                    "reverse": True,
+                    "model": Car,
+                    "pk_set": {self.bmw.pk, self.vw.pk},
+                },
+                {
+                    "instance": sunroof_pk,
+                    "action": "post_remove",
+                    "reverse": True,
+                    "model": Car,
+                    "pk_set": {self.bmw.pk, self.vw.pk},
+                },
+            ],
+        )
+
+    def test_m2m_relation_signals_with_self_object_deletion(self):
+        self.alice.friends.add(self.bob)
+        self._initialize_signal_person()
+        alice_pk = self.alice.pk
+        self.alice.delete()
+        self.assertEqual(
+            self.m2m_changed_messages_as_pks,
+            [
+                {
+                    "instance": alice_pk,
+                    "action": "pre_remove",
+                    "reverse": False,
+                    "model": Person,
+                    "pk_set": {self.bob.pk},
+                },
+                {
+                    "instance": alice_pk,
+                    "action": "post_remove",
+                    "reverse": False,
+                    "model": Person,
+                    "pk_set": {self.bob.pk},
+                },
+            ],
+        )
+
+    def test_m2m_relations_signals_when_inheritance_delete_obj_forward(self):
+        self.maxDiff = None
+        expected_messages = []
+        c4 = SportsCar.objects.create(name="Bugatti", price="1000000")
+        c4b = Car.objects.get(name="Bugatti")
+        c4.default_parts.set([self.doors, self.engine])
+        self._initialize_signal_car()
+        engine_pk = self.engine.pk
+        self.engine.delete()
+        expected_messages.append(
+            {
+                "instance": engine_pk,
+                "action": "pre_remove",
+                "reverse": True,
+                "model": Car,
+                "pk_set": {c4b.pk},
+            }
+        )
+        expected_messages.append(
+            {
+                "instance": engine_pk,
+                "action": "post_remove",
+                "reverse": True,
+                "model": Car,
+                "pk_set": {c4b.pk},
+            }
+        )
+        self.assertEqual(self.m2m_changed_messages_as_pks, expected_messages)
+
+    def test_m2m_relations_signals_when_inheritance_delete_obj_forward(self):
+        self.maxDiff = None
+        expected_messages = []
+        c4 = SportsCar.objects.create(name="Bugatti", price="1000000")
+        c4b = Car.objects.get(name="Bugatti")
+        c4.default_parts.set([self.doors, self.engine])
+        self._initialize_signal_car()
+
+        c4.delete()
+        expected_messages.append(
+            {
+                "instance": c4b.pk,
+                "action": "pre_remove",
+                "reverse": False,
+                "model": Part,
+                "pk_set": {self.doors.pk, self.engine.pk},
+            }
+        )
+        expected_messages.append(
+            {
+                "instance": c4b.pk,
+                "action": "post_remove",
+                "reverse": False,
+                "model": Part,
+                "pk_set": {self.doors.pk, self.engine.pk},
+            }
+        )
+        self.assertEqual(self.m2m_changed_messages_as_pks, expected_messages)
